@@ -1,0 +1,546 @@
+import numpy as np
+import pandas as pd
+import os, copy, warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.model_selection import KFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.neighbors import NearestNeighbors
+
+from sklearn.neural_network import MLPRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.svm import SVR
+
+from scipy.stats import wilcoxon
+
+
+# ======================
+# 全局参数
+# ======================
+FILE_PATH = "dataok1.xlsx"
+
+RANDOM_STATE = 42
+
+# replicate-level analysis
+N_REPEATS = 100
+N_SPLITS = 5
+
+# Yang ARM 参数
+ARM_SPLITS = 20
+ARM_TRAIN_RATIO = 0.5
+
+# Local Adaptive Mixing 参数
+LOCAL_K = 50
+LOCAL_ETA = 2.0
+LOCAL_EPS = 1e-8
+LOCAL_TOPK = None
+
+# 训练集内部 OOF 参数
+OOF_FOLDS = 5
+
+
+# ======================
+# 工具函数
+# ======================
+def calc_metrics(y_true, y_pred):
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    mae  = float(mean_absolute_error(y_true, y_pred))
+    r2   = float(r2_score(y_true, y_pred))
+    return rmse, mae, r2
+
+
+def oof_predictions(model, Xtr, ytr, n_splits=5, seed=42):
+    """
+    在训练集内部做 K-fold OOF 预测
+    """
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    oof = np.zeros(len(ytr), dtype=float)
+
+    for tr_idx, val_idx in kf.split(Xtr):
+        m = copy.deepcopy(model)
+        m.fit(Xtr.iloc[tr_idx], ytr[tr_idx])
+        oof[val_idx] = m.predict(Xtr.iloc[val_idx])
+
+    return oof
+
+
+def global_weighted_predict(pred_dict, weights):
+    yhat = np.zeros(len(next(iter(pred_dict.values()))), dtype=float)
+    for m in pred_dict:
+        yhat += weights[m] * pred_dict[m]
+    return yhat
+
+
+def equal_weight_predict(pred_dict):
+    model_names = list(pred_dict.keys())
+    yhat = np.zeros(len(next(iter(pred_dict.values()))), dtype=float)
+    w = 1.0 / len(model_names)
+    for m in model_names:
+        yhat += w * pred_dict[m]
+    return yhat
+
+
+def yang_arm_weights(models, X, y, splits=20, train_ratio=0.5, seed=42):
+    """
+    Yang-style ARM:
+    repeated split + predictive score + exp-normalization + average weights
+    """
+    rng = np.random.default_rng(seed)
+    model_names = list(models.keys())
+    weights_all = []
+
+    n = len(X)
+    n_train = int(n * train_ratio)
+
+    for _ in range(splits):
+        idx = rng.permutation(n)
+        tr = idx[:n_train]
+        te = idx[n_train:]
+
+        scores = []
+        for m in model_names:
+            model = copy.deepcopy(models[m])
+            model.fit(X.iloc[tr], y[tr])
+
+            pred_te = model.predict(X.iloc[te])
+            res = y[te] - pred_te
+
+            sigma = np.sqrt(np.mean(res**2) + 1e-12)
+            score = - n_train * np.log(sigma) - np.sum(res**2) / (2 * sigma**2)
+            scores.append(score)
+
+        scores = np.array(scores)
+        scores = scores - scores.max()
+
+        w = np.exp(scores)
+        w = w / w.sum()
+
+        weights_all.append(w)
+
+    weights_all = np.array(weights_all)
+    w_final = weights_all.mean(axis=0)
+    return dict(zip(model_names, w_final))
+
+
+def local_adaptive_mixing_predict(pred_dict, oof_res_dict, X_ref, X_query,
+                                  k_neighbors=50, eta=2.0, topk=None, exclude_self=False):
+    """
+    pred_dict: 各模型对 X_query 的预测，格式 {model_name: pred_array}
+    oof_res_dict: 各模型在 X_ref 上的 OOF 残差，格式 {model_name: residual_array}
+    X_ref: 参考集（通常为训练集）
+    X_query: 待预测集
+    """
+    scaler = StandardScaler()
+    Xref_s = scaler.fit_transform(X_ref.values)
+    Xq_s   = scaler.transform(X_query.values)
+
+    nn_k = min(k_neighbors + (1 if exclude_self else 0), len(X_ref))
+    nn = NearestNeighbors(n_neighbors=nn_k, metric="euclidean")
+    nn.fit(Xref_s)
+    nbr_idx = nn.kneighbors(Xq_s, return_distance=False)
+
+    model_names = list(pred_dict.keys())
+    yhat = np.zeros(len(X_query), dtype=float)
+
+    for i in range(len(X_query)):
+        idx = nbr_idx[i]
+
+        if exclude_self:
+            idx = idx[idx != i]
+            idx = idx[:min(k_neighbors, len(idx))]
+
+        local_mse = np.array([np.mean(oof_res_dict[m][idx] ** 2) for m in model_names])
+
+        if topk is not None and topk < len(model_names):
+            keep = np.argsort(local_mse)[:topk]
+            w_raw = np.zeros_like(local_mse)
+            denom = np.mean(local_mse[keep]) + LOCAL_EPS
+            w_raw[keep] = np.exp(-eta * local_mse[keep] / denom)
+        else:
+            denom = np.mean(local_mse) + LOCAL_EPS
+            w_raw = np.exp(-eta * local_mse / denom)
+
+        w = w_raw / (w_raw.sum() + LOCAL_EPS)
+        yhat[i] = np.sum(w * np.array([pred_dict[m][i] for m in model_names]))
+
+    return yhat
+
+
+# ======================
+# 构建模型
+# ======================
+def build_models(seed=42):
+    models = {
+        "ANN": Pipeline([
+            ("scaler", StandardScaler()),
+            ("mlp", MLPRegressor(
+                hidden_layer_sizes=(64, 32),
+                activation="relu",
+                solver="adam",
+                alpha=1e-4,
+                learning_rate_init=1e-3,
+                max_iter=2000,
+                early_stopping=True,
+                validation_fraction=0.15,
+                n_iter_no_change=30,
+                random_state=seed
+            ))
+        ]),
+
+        "RF": RandomForestRegressor(
+            n_estimators=600,
+            random_state=seed,
+            n_jobs=-1
+        ),
+
+        "SVM": Pipeline([
+            ("scaler", StandardScaler()),
+            ("svr", SVR(kernel="rbf", C=50.0, gamma="scale", epsilon=0.1))
+        ]),
+
+        "GBR": GradientBoostingRegressor(
+            n_estimators=800,
+            learning_rate=0.05,
+            max_depth=3,
+            subsample=0.9,
+            random_state=seed
+        )
+    }
+    return models
+
+
+# ======================
+# 单个 fold 的全部方法训练与预测
+# ======================
+def run_one_fold(X_train, X_test, y_train, y_test, seed):
+    models = build_models(seed)
+
+    train_pred = {}
+    test_pred = {}
+
+    # ----------------------
+    # 单模型
+    # ----------------------
+    for name, model in models.items():
+        model.fit(X_train, y_train)
+        train_pred[name] = model.predict(X_train)
+        test_pred[name]  = model.predict(X_test)
+
+    # ----------------------
+    # Equal Weight
+    # ----------------------
+    yhat_eq_test = equal_weight_predict(test_pred)
+
+    # ----------------------
+    # ARM
+    # ----------------------
+    w_arm = yang_arm_weights(
+        models, X_train, y_train,
+        splits=ARM_SPLITS,
+        train_ratio=ARM_TRAIN_RATIO,
+        seed=seed
+    )
+    yhat_arm_test = global_weighted_predict(test_pred, w_arm)
+
+    # ----------------------
+    # 训练集内部 OOF
+    # ----------------------
+    oof_pred = {
+        name: oof_predictions(model, X_train, y_train, n_splits=OOF_FOLDS, seed=seed)
+        for name, model in models.items()
+    }
+    oof_res = {m: (y_train - oof_pred[m]) for m in models}
+
+    # ----------------------
+    # L-AM
+    # ----------------------
+    yhat_lam_test = local_adaptive_mixing_predict(
+        test_pred, oof_res, X_train, X_test,
+        k_neighbors=LOCAL_K, eta=LOCAL_ETA,
+        topk=LOCAL_TOPK, exclude_self=False
+    )
+
+    # ----------------------
+    # dominant learner 选择（基于 OOF RMSE）
+    # ----------------------
+    oof_rmse = {m: np.sqrt(mean_squared_error(y_train, oof_pred[m])) for m in models}
+    dominant = min(oof_rmse, key=oof_rmse.get)
+
+    yhat_dom_train = train_pred[dominant]
+    yhat_dom_test  = test_pred[dominant]
+
+    # residual target
+    r_train = y_train - yhat_dom_train
+
+    # residual learners：除 dominant 外
+    res_models = {m: models[m] for m in models if m != dominant}
+
+    r_train_pred = {}
+    r_test_pred = {}
+
+    for m in res_models:
+        model = copy.deepcopy(res_models[m])
+        model.fit(X_train, r_train)
+        r_train_pred[m] = model.predict(X_train)
+        r_test_pred[m]  = model.predict(X_test)
+
+    # ----------------------
+    # DL-ARM
+    # dominant learner + global ARM on residuals
+    # ----------------------
+    w_res = yang_arm_weights(
+        res_models, X_train, r_train,
+        splits=ARM_SPLITS,
+        train_ratio=ARM_TRAIN_RATIO,
+        seed=seed
+    )
+    rhat_dlarm_test = global_weighted_predict(r_test_pred, w_res)
+    yhat_dlarm_test = yhat_dom_test + rhat_dlarm_test
+
+    # ----------------------
+    # DLAM
+    # dominant learner + local adaptive mixing on residuals
+    # ----------------------
+    oof_r_pred = {
+        m: oof_predictions(copy.deepcopy(res_models[m]), X_train, r_train,
+                           n_splits=OOF_FOLDS, seed=seed)
+        for m in res_models
+    }
+    oof_r_res = {m: (r_train - oof_r_pred[m]) for m in res_models}
+
+    rhat_dlam_test = local_adaptive_mixing_predict(
+        r_test_pred, oof_r_res, X_train, X_test,
+        k_neighbors=LOCAL_K, eta=LOCAL_ETA,
+        topk=LOCAL_TOPK, exclude_self=False
+    )
+    yhat_dlam_test = yhat_dom_test + rhat_dlam_test
+
+    pred_map = {
+        "ANN": test_pred["ANN"],
+        "RF": test_pred["RF"],
+        "SVM": test_pred["SVM"],
+        "GBR": test_pred["GBR"],
+        "Equal Weight": yhat_eq_test,
+        "ARM": yhat_arm_test,
+        "L-AM": yhat_lam_test,
+        "DL-ARM": yhat_dlarm_test,
+        "DLAM": yhat_dlam_test
+    }
+
+    return pred_map
+
+
+# ======================
+# 读取数据
+# ======================
+if not os.path.exists(FILE_PATH):
+    raise FileNotFoundError(f"找不到文件：{FILE_PATH}")
+
+raw = pd.read_excel(FILE_PATH)
+raw.columns = raw.columns.astype(str).str.strip()
+
+feature_cols = [
+    "water kg/m3",
+    "cement",
+    "Admixtures",
+    "strength of cement mortar Mpa",
+    "cement2",
+    "water-cement",
+    "water-cementitious",
+    "material ratio"
+]
+target_col = "compressive strength of concrete"
+
+missing_cols = [c for c in feature_cols + [target_col] if c not in raw.columns]
+if missing_cols:
+    raise ValueError(f"以下列在数据中不存在：{missing_cols}\n当前列名为：{raw.columns.tolist()}")
+
+for c in feature_cols + [target_col]:
+    raw[c] = pd.to_numeric(raw[c], errors="coerce")
+
+df = raw[feature_cols + [target_col]].dropna().reset_index(drop=True)
+
+X = df[feature_cols].copy()
+y = df[target_col].astype(float).values
+
+print("=== Data summary ===")
+print("Shape:", df.shape)
+print("X shape:", X.shape, "y shape:", y.shape)
+print("y range:", float(y.min()), "~", float(y.max()))
+print("Features:", feature_cols)
+
+
+# ======================
+# replicate-level analysis 容器
+# ======================
+method_names = ["ANN", "RF", "SVM", "GBR", "Equal Weight", "ARM", "L-AM", "DL-ARM", "DLAM"]
+
+# 每个方法保存 100 个 replicate-level 指标
+replicate_metrics = {
+    m: {"RMSE": [], "MAE": [], "R2": []}
+    for m in method_names
+}
+
+# 保存每次 replicate 的明细结果（画箱线图很有用）
+replicate_detail_rows = []
+
+# 保存最后一次 replicate 的 OOF prediction（画 actual-vs-predicted 很有用）
+final_rep_oof_pred = None
+
+
+# ======================
+# Repeated 100×5-fold CV
+# 每次 5-fold CV 作为一个 replicate
+# ======================
+for rep in range(N_REPEATS):
+    rep_seed = RANDOM_STATE + rep
+    print(f"Running replicate {rep+1}/{N_REPEATS} (seed={rep_seed}) ...")
+
+    kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=rep_seed)
+
+    # 每个 replicate 内，先收集全部 OOF 预测
+    rep_oof_pred = {
+        m: np.zeros(len(X), dtype=float)
+        for m in method_names
+    }
+
+    for fold_id, (train_idx, test_idx) in enumerate(kf.split(X), start=1):
+        fold_seed = rep_seed * 100 + fold_id
+
+        X_train = X.iloc[train_idx].reset_index(drop=True)
+        X_test  = X.iloc[test_idx].reset_index(drop=True)
+        y_train = y[train_idx]
+        y_test  = y[test_idx]
+
+        pred_map = run_one_fold(X_train, X_test, y_train, y_test, seed=fold_seed)
+
+        # 把当前 test fold 的预测写回全体样本位置
+        for m in method_names:
+            rep_oof_pred[m][test_idx] = pred_map[m]
+
+    # ----------------------
+    # 这一整次 5-fold CV 完成后
+    # 用全体 n 个 OOF predictions 计算 1 个 replicate-level 指标
+    # ----------------------
+    for m in method_names:
+        rmse, mae, r2 = calc_metrics(y, rep_oof_pred[m])
+
+        replicate_metrics[m]["RMSE"].append(rmse)
+        replicate_metrics[m]["MAE"].append(mae)
+        replicate_metrics[m]["R2"].append(r2)
+
+        replicate_detail_rows.append({
+            "Replicate": rep + 1,
+            "Seed": rep_seed,
+            "Model": m,
+            "RMSE": rmse,
+            "MAE": mae,
+            "R2": r2
+        })
+
+    # 保存最后一次 replicate 的所有样本 OOF prediction
+    if rep == N_REPEATS - 1:
+        final_rep_oof_pred = copy.deepcopy(rep_oof_pred)
+
+
+# ======================
+# 汇总结果：100 个 replicate-level 指标的 mean ± std
+# ======================
+summary_rows = []
+for m in method_names:
+    row = {
+        "Model": m,
+        "RMSE_mean": np.mean(replicate_metrics[m]["RMSE"]),
+        "RMSE_std": np.std(replicate_metrics[m]["RMSE"], ddof=1),
+        "MAE_mean": np.mean(replicate_metrics[m]["MAE"]),
+        "MAE_std": np.std(replicate_metrics[m]["MAE"], ddof=1),
+        "R2_mean": np.mean(replicate_metrics[m]["R2"]),
+        "R2_std": np.std(replicate_metrics[m]["R2"], ddof=1),
+    }
+    summary_rows.append(row)
+
+summary_df = pd.DataFrame(summary_rows)
+
+print("\n=== Repeated 100×5-fold CV Replicate-level Summary (mean ± std) ===")
+print(summary_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+
+
+# ======================
+# paper-ready summary table
+# ======================
+summary_df["RMSE (mean±std)"] = summary_df.apply(
+    lambda r: f"{r['RMSE_mean']:.4f} ± {r['RMSE_std']:.4f}", axis=1
+)
+summary_df["MAE (mean±std)"] = summary_df.apply(
+    lambda r: f"{r['MAE_mean']:.4f} ± {r['MAE_std']:.4f}", axis=1
+)
+summary_df["R2 (mean±std)"] = summary_df.apply(
+    lambda r: f"{r['R2_mean']:.4f} ± {r['R2_std']:.4f}", axis=1
+)
+
+paper_table = summary_df[["Model", "RMSE (mean±std)", "MAE (mean±std)", "R2 (mean±std)"]]
+
+print("\n=== Paper-ready summary table ===")
+print(paper_table.to_string(index=False))
+
+
+# ======================
+# 显著性检验：DLAM vs others
+# 基于 100 个 replicate-level 指标做 paired Wilcoxon
+# ======================
+print("\n=== Wilcoxon signed-rank test (DLAM vs others) on replicate-level RMSE ===")
+for m in method_names:
+    if m == "DLAM":
+        continue
+    stat, p = wilcoxon(replicate_metrics[m]["RMSE"], replicate_metrics["DLAM"]["RMSE"])
+    print(f"{m:12s} vs DLAM -> statistic={stat:.4f}, p-value={p:.6f}")
+
+print("\n=== Wilcoxon signed-rank test (DLAM vs others) on replicate-level MAE ===")
+for m in method_names:
+    if m == "DLAM":
+        continue
+    stat, p = wilcoxon(replicate_metrics[m]["MAE"], replicate_metrics["DLAM"]["MAE"])
+    print(f"{m:12s} vs DLAM -> statistic={stat:.4f}, p-value={p:.6f}")
+
+
+# ======================
+# 保存结果
+# ======================
+
+# 1) 汇总表
+summary_df.to_csv("repeated_100x5cv_replicate_summary_full.csv", index=False)
+paper_table.to_csv("repeated_100x5cv_replicate_summary_paper.csv", index=False)
+
+# 2) 每次 replicate 明细表（画箱线图最重要）
+replicate_detail_df = pd.DataFrame(replicate_detail_rows)
+replicate_detail_df.to_csv("repeated_100x5cv_replicate_detail.csv", index=False)
+
+# 3) 保存最后一次 replicate 的预测结果（画 actual-vs-predicted / residual 最方便）
+prediction_save_df = pd.DataFrame({
+    "Actual": y
+})
+
+for m in method_names:
+    prediction_save_df[f"{m}_pred"] = final_rep_oof_pred[m]
+    prediction_save_df[f"{m}_residual"] = y - final_rep_oof_pred[m]
+
+prediction_save_df.to_csv("repeated_100x5cv_last_replicate_predictions.csv", index=False)
+
+# 4) 额外保存一个只含 GBR / DLAM 的精简文件（画图更方便）
+prediction_plot_df = pd.DataFrame({
+    "Actual": y,
+    "GBR_pred": final_rep_oof_pred["GBR"],
+    "DLAM_pred": final_rep_oof_pred["DLAM"],
+    "GBR_residual": y - final_rep_oof_pred["GBR"],
+    "DLAM_residual": y - final_rep_oof_pred["DLAM"]
+})
+prediction_plot_df.to_csv("repeated_100x5cv_last_replicate_GBR_DLAM.csv", index=False)
+
+print("\nSaved:")
+print(" - repeated_100x5cv_replicate_summary_full.csv")
+print(" - repeated_100x5cv_replicate_summary_paper.csv")
+print(" - repeated_100x5cv_replicate_detail.csv")
+print(" - repeated_100x5cv_last_replicate_predictions.csv")
+print(" - repeated_100x5cv_last_replicate_GBR_DLAM.csv")
