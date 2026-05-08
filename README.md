@@ -1,2 +1,2 @@
 # AIMA
-Dataset for AI-Based Adaptive Residual Model Averaging Approach for Concrete Compressive Strength Prediction
+Dataset for Adaptive Residual Model Averaging for Predicting Concrete Compressive Strength
